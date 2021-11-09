@@ -1,0 +1,243 @@
+#!/usr/bin/env python 
+
+################################################################################
+### COPYRIGHT ##################################################################
+
+# Copyright (c) 2020, New York Genome Center
+# All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in
+#       the documentation and/or other materials provided with the
+#       distribution.
+#     * Neither the name of the <organization> nor the names of its
+#       contributors may be used to endorse or promote products derived
+#       from this software without specific prior written permission.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+# PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL <COPYRIGHT HOLDER>
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+# BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+################################################################# /COPYRIGHT ###
+################################################################################
+
+
+
+################################################################################
+### MODULES ####################################################################
+
+from optparse import OptionParser
+import sys
+from re import findall
+from operator import itemgetter
+
+################################################################### /MODULES ###
+################################################################################
+
+
+
+################################################################################
+### FUNCTIONS ##################################################################
+
+def readmap(filepath):
+	if filepath != 'stdin':
+		mapfile = open(filepath, 'r')
+	else:
+		mapfile = sys.stdin
+	for line in mapfile:
+		yield line.rstrip('\n').split('\t')
+
+def nbesthits(strata):
+	return next((x for i, x in enumerate((int(h) for h in strata.split(':') if h != '!')) if x), 0)
+	
+def reflength(matchstring):
+	return sum([int(s) for s in findall(r'\d+(?!\-)', matchstring)]) + len(findall(r'[A-z]', matchstring))
+
+def getbesthits(strata, aligns):
+	for chrm, strand, start, matchstring in (hit.split(':') for hit in aligns.split(',')[:nbesthits(strata)]):
+		start = int(start) -1
+		end = start + reflength(matchstring)
+		yield chrm, strand, start, end
+		
+def gem2bed(gem, maxhits):
+	for name, sequence, quality, strata, alignments in gem:
+		nbesthits = next((x for i, x in enumerate((int(h) for h in strata.split(':') if h != '!')) if x), 0)
+		if nbesthits <= maxhits:
+			for chromosome, strand, start, end in getbesthits(strata, alignments):
+				yield chromosome, start, end, name, nbesthits, strand
+	
+def readbed(filepath):
+	if filepath == 'stdin':
+		bedseq = sys.stdin
+	else:
+		bedseq = open(filepath, 'r')
+	for line in bedseq:
+		chromosome, start, end, name, score, strand = line.rstrip().split('\t')[:6]
+		yield chromosome, int(start), int(end), name, int(score), strand			
+
+def sortbed(bed):
+	name0 = None
+	hits = []
+	for chromosome, start, end, name, score, strand in bed:
+		if name != name0:
+			if name0:
+				for hit in sorted(hits, key = itemgetter(0, 1, 2)):
+					yield hit[:6]
+			name0 = name
+			hits = []
+		hits.append((chromosome, start, end, name, score, strand))
+	if name0:
+		for hit in sorted(hits, key = itemgetter(0, 1, 2)):
+			yield hit[:6]
+		
+def collapsesortedbed(sortedbed):
+	chromosome0, start0, end0, name0, score0, strand0  = None, None, None, None, None, None
+	for chromosome, start, end, name, score, strand in sortedbed:
+		if name != name0 or chromosome != chromosome0 or strand != strand0 or start > end0:
+			if name0:
+				yield chromosome0, start0, end0, name0, score0, strand0
+			chromosome0, start0, end0, name0, score0, strand0  = chromosome, start, end, name, score, strand	
+		else:
+			if end > end0:
+				end0 = end
+				score0 =  min([score0, score])
+	if name0:
+		yield chromosome0, start0, end0, name0, score0, strand		
+
+def getregions(bed, maxdist):
+	basename0 = None
+	hits = {'l':[], 'r':[]}
+	for chromosome, start, end, name, score, strand in bed:
+		basename, terminus = name.split('|')
+		if basename != basename0:
+			if basename0:
+				for lchromosome, lstart, lend, lname, lscore, lstrand in hits['l']:
+					for rchromosome, rstart, rend, rname, rscore, rstrand in hits['r']:
+						if lchromosome == rchromosome and lstrand == rstrand:
+							if lstrand == '+' and (lstart + lend) <= (rstart + rend) and (rstart - lend) <= maxdist:
+								yield [lchromosome, lstart, rend, basename0, [lend-lstart, lscore, rend-rstart, rscore, rstart - lend], lstrand]
+							elif lstrand == '-' and (lstart + lend) >= (rstart + rend) and (lstart - rend) <= maxdist:
+								yield [lchromosome, rstart, lend, basename0, [rend-rstart, rscore, lend-lstart, lscore, lstart - rend], lstrand]
+			basename0 = basename
+			hits = {'l':[], 'r':[]} 
+		hits[terminus].append((chromosome, start, end, name, score, strand))
+	if basename0:
+		for lchromosome, lstart, lend, lname, lscore, lstrand in hits['l']:
+			for rchromosome, rstart, rend, rname, rscore, rstrand in hits['r']:
+				if lchromosome == rchromosome and lstrand == rstrand:
+					if lstrand == '+' and (lstart + lend) <= (rstart + rend) and (rstart - lend) <= maxdist:
+						yield [lchromosome, lstart, rend, basename0, [lend-lstart, lscore, rend-rstart, rscore, rstart - lend], lstrand]
+					elif lstrand == '-' and (lstart + lend) >= (rstart + rend) and (lstart - rend) <= maxdist:
+						yield [lchromosome, rstart, lend, basename0, [rend-rstart, rscore, lend-lstart, lscore, lstart - rend], lstrand]
+
+def groupregions(bed):
+	name0 = None
+	group = []
+	for chromosome, start, end, name, score, strand in bed:
+		if name != name0:
+			if name0:
+				yield group
+			name0 = name
+			group = []
+		group.append([chromosome, start, end, name, score, strand])
+	if name0:
+		yield group
+
+def rankgroupcalls(groups):
+	def sortfunction(x):
+		sortedx = sorted(((x[4][1],-x[4][0]),(x[4][3],-x[4][2])))
+		return (sortedx[0][0], sortedx[1][0], sortedx[0][1], sortedx[1][1]) 
+	for group in groups:
+		sortedgroup = sorted(group, key = sortfunction)
+		sortedscores = [interval[4][:4] for interval in sortedgroup]
+		for interval in sortedgroup:
+			interval[4] += [sortedscores.index(interval[4][:4])+1, sortedscores.count(interval[4][:4]),len(sortedscores)]
+		yield sortedgroup
+
+		
+################################################################# /FUNCTIONS ###
+################################################################################
+
+
+
+################################################################################
+### ARGUMENTS,OPTIONS ##########################################################
+
+parser = OptionParser(usage="\n%prog [options]", version="%prog 0.1")
+
+parser.add_option(
+	"-i",
+	metavar = "FILE",
+	type = "string",
+	dest = "gem",
+	default = 'stdin',
+	help = "Input GEM filename [STDIN]"
+	)
+
+parser.add_option(
+	"-d",
+	metavar = "INT",
+	type = "int",
+	dest = "maxdist",
+	default = 1000,
+	help = "Maximum hit distance [1000]"
+	)
+
+parser.add_option(
+	"-m",
+	metavar = "INT",
+	type = "int",
+	dest = "maxhits",
+	default = 1,
+	help = "Maximum number of best hits [1]"
+	)
+
+(opt, args) = parser.parse_args()
+        
+######################################################### /ARGUMENTS,OPTIONS ###
+################################################################################
+
+
+
+################################################################################
+### CONSTANTS ##################################################################
+
+################################################################# /CONSTANTS ###
+################################################################################
+
+
+
+################################################################################
+### MAIN #######################################################################
+
+if __name__ == "__main__":
+
+	# read GEM map file and get putative insertion regions
+	gem = readmap(opt.gem)
+	bed = gem2bed(gem, opt.maxhits)
+	sortedbed = sortbed(bed)
+	collapsedbed = collapsesortedbed(sortedbed)
+	regions = getregions(collapsedbed, opt.maxdist)	
+	groups = groupregions(regions)
+	ranked = rankgroupcalls(groups)
+
+	for group in ranked:
+		for region in group:
+			region[4] = ':'.join(str(v) for v in region[4])
+			print '\t'.join(str(v) for v in region)
+
+###################################################################### /MAIN ###
+################################################################################

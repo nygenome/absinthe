@@ -1,0 +1,191 @@
+#!/bin/bash
+
+#########################################################################
+
+# Copyright (c) 2020, New York Genome Center
+# All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in
+#       the documentation and/or other materials provided with the
+#       distribution.
+#     * Neither the name of the <organization> nor the names of its
+#       contributors may be used to endorse or promote products derived
+#       from this software without specific prior written permission.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+# PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL <COPYRIGHT HOLDER>
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+# BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#########################################################################
+
+
+#########################################################################
+(>&2 echo `date` START on ${HOSTNAME} using ${THREADS} cores) ;
+#########################################################################
+
+SAMPLE=${1} ;
+FASTA=${2} ;
+OUTDIR=${3} ;
+
+HUMANGENOME=${4} ;
+HUMAN_NOALT_INDEX=${5} ;
+
+REFERENCES="panTro6 panPan2 gorGor5 ponAbe3" ;
+GENOMES=${6} ;  # directory containing the UCSC hominid references (bwa indexed)
+CHAINS=${7} ; # directory containing the UCSC chain files
+
+THREADS=${8} ;
+
+OUTDIR=$(realpath ${OUTDIR}) ;
+LOGDIR=${OUTDIR}/log ; 
+
+mkdir -p ${OUTDIR} ;
+mkdir -p ${LOGDIR} ;
+
+### ab initio calling ###################################################
+echo `date` CALLING  STARTED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+
+cat ${FASTA} \
+    | maketermini -m 25 -M 500 \
+    | gem-mapper -I ${HUMAN_NOALT_INDEX} -q ignore -m 0.04 -e 0.04 --mismatch-alphabet ACTGN --fast-mapping  -T ${THREADS} -d 1 \
+    | getregions -m 64 \
+    | tee ${OUTDIR}/${SAMPLE}.abinitio.intervals.bed \
+    | grep -w "1:1:1" \
+    | makebedqt -q ${FASTA} -t ${HUMANGENOME} \
+    | parallel_ordered -c "alignment_wrapper -p ${OUTDIR}/" -p ${THREADS} -n 2 \
+    | tee ${OUTDIR}/${SAMPLE}.abinitio.calls.bedpe \
+    | awk -F"\t" '$7=="insertion"' \
+    | makebedpeseq -q ${FASTA} -t ${HUMANGENOME} \
+    | sort -k1,1V -k2,2n -k3,3n \
+    | charquery > ${OUTDIR}/${SAMPLE}.abinitio.insertions.bedpeseq ; 
+
+echo "PIPESTATUS:" "${PIPESTATUS[@]}" >> ${LOGDIR}/${SAMPLE}.log ;
+    
+echo `date` CALLING  FINISHED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+#########################################################################
+
+
+for REFERENCE in ${REFERENCES};
+do
+    GENOME=${GENOMES}/${REFERENCE}.fa ;
+    CHAIN=${CHAINS}/${REFERENCE}ToHg38.over.chain ;
+
+    ### mapping #########################################################
+    echo `date` MAPPING_${REFERENCE} STARTED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+
+    cat ${FASTA} \
+	| fasta2fq \
+	| bwa mem ${GENOME} - -M -t ${THREADS} \
+	| samtools sort -O bam -m 2G -@ ${THREADS} - \
+	| tee ${OUTDIR}/${SAMPLE}.${REFERENCE}.contigs.bam \
+	| samtools view -F 3844 - \
+	| sam2bed \
+	| bedtools sort > ${OUTDIR}/${SAMPLE}.${REFERENCE}.contigs.bed ;
+
+    echo "PIPESTATUS:" "${PIPESTATUS[@]}" >> ${LOGDIR}/${SAMPLE}.log ;
+    
+    
+    echo `date` MAPPING_${REFERENCE} FINISHED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+    #####################################################################
+
+
+    ### pilescaff #######################################################
+    echo `date` PILESCAFF_${REFERENCE} STARTED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+    
+    samtools view -F 3844 ${OUTDIR}/${SAMPLE}.${REFERENCE}.contigs.bam \
+	| sam2chg \
+	| chg2pileup -f ${GENOME} \
+	| tee ${OUTDIR}/${SAMPLE}.${REFERENCE}.pileup \
+	| pileup2scaffolds -e 1 -g 2500 -p ${SAMPLE}.${REFERENCE} 2> ${OUTDIR}/${SAMPLE}.${REFERENCE}.scaffolds.fa \
+	| bedtools intersect -a stdin -b ${OUTDIR}/${SAMPLE}.${REFERENCE}.contigs.bed -wao \
+	| sort -t$'\t' -k7,7 -k8,8n -k9,9 \
+	| addcontigs > ${OUTDIR}/${SAMPLE}.${REFERENCE}.scaffolds.bed ;
+
+    echo "PIPESTATUS:" "${PIPESTATUS[@]}" >> ${LOGDIR}/${SAMPLE}.log ;
+
+    gzip -f ${OUTDIR}/${SAMPLE}.${REFERENCE}.pileup ; 
+
+    echo "PIPESTATUS:" "${PIPESTATUS[@]}" >> ${LOGDIR}/${SAMPLE}.log ;
+        
+    echo `date` PILESCAFF_${REFERENCE} FINISHED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+    #####################################################################
+
+
+    ### liftover ########################################################
+    echo `date` LIFTOVER_${REFERENCE} STARTED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+
+    (
+	cat ${OUTDIR}/${SAMPLE}.${REFERENCE}.scaffolds.bed \
+	    | liftOver -minMatch=0.001 -multiple stdin ${CHAIN} stdout /dev/null ; \
+	cat ${OUTDIR}/${SAMPLE}.${REFERENCE}.scaffolds.bed \
+	    | liftOver -ends=1 stdin ${CHAIN} stdout /dev/null ; \
+	    ) \
+	    | sort -k4,4V -k1,1V -k2,2n -k3,3n \
+	    | processliftover -s ${OUTDIR}/${SAMPLE}.${REFERENCE}.scaffolds.bed > ${OUTDIR}/${SAMPLE}.${REFERENCE}.scaffolds.liftOver.bedpe ;
+
+    echo "PIPESTATUS:" "${PIPESTATUS[@]}" >> ${LOGDIR}/${SAMPLE}.log ;
+
+    echo `date` LIFTOVER_${REFERENCE} FINISHED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+    #####################################################################
+
+
+    ### caller ##########################################################
+    echo `date` CALLER_${REFERENCE} STARTED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+
+    cat ${OUTDIR}/${SAMPLE}.${REFERENCE}.scaffolds.liftOver.bedpe \
+	| cut -f 4,5,6,7,8,10 \
+	| awk -F"\t" '$1!="." && $3-$2<10000' \
+	| makebedqt -q ${OUTDIR}/${SAMPLE}.${REFERENCE}.scaffolds.fa -t ${HUMANGENOME} \
+	| parallel_ordered -c "alignment_wrapper -p ${OUTDIR}/" -p ${THREADS} -n 2 \
+	| tee ${OUTDIR}/${SAMPLE}.${REFERENCE}.calls.bedpe \
+	| awk -F"\t" '$7=="insertion"' \
+	| makebedpeseq -q ${OUTDIR}/${SAMPLE}.${REFERENCE}.scaffolds.fa -t ${HUMANGENOME} \
+	| sort -k1,1V -k2,2n -k3,3n \
+	| charquery > ${OUTDIR}/${SAMPLE}.${REFERENCE}.insertions.bedpeseq;
+
+    echo "PIPESTATUS:" "${PIPESTATUS[@]}" >> ${LOGDIR}/${SAMPLE}.log ;
+
+    echo `date` CALLER_${REFERENCE} FINISHED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+    #####################################################################
+    
+    
+done ;
+
+
+### filter/merge ########################################################
+echo `date` FILTER  STARTED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+
+cat ${OUTDIR}/${SAMPLE}.*.insertions.bedpeseq \
+    | parGRCh38_X2Y \
+    | sort -k1,1V -k2,2n -k3,3n \
+    | rankselect_insertions -d 100 -t 50 \
+    | egrep "\|1:[0-9]{1,2}:[0-9]{1,2}:[0-9]{1,2}\|1:[0-9]{1,2}:[0-9]{1,2}:[0-9]{1,2}" \
+    | sort -k1,1V -k2,2n -k3,3n \
+    | fixamb \
+    | tee ${OUTDIR}/${SAMPLE}.insertions.bedpeseq \
+    | bedpeseq2vcf -r ${HUMANGENOME} > ${OUTDIR}/${SAMPLE}.insertions.vcf ;   
+
+echo "PIPESTATUS:" "${PIPESTATUS[@]}" >> ${LOGDIR}/${SAMPLE}.log ;
+    
+echo `date` FILTER  FINISHED on ${HOSTNAME} >> ${LOGDIR}/${SAMPLE}.log ;
+#########################################################################
+
+
+#########################################################################
+(>&2 echo) ;
+(>&2 echo `date` FINISH on ${HOSTNAME} using ${THREADS} cores) ;
+#########################################################################
